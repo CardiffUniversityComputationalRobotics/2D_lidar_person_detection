@@ -1,6 +1,7 @@
-# import time
 import numpy as np
-import rospy
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
 
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Point, Pose, PoseArray
@@ -9,10 +10,12 @@ from visualization_msgs.msg import Marker
 from dr_spaam.detector import Detector
 
 
-class DrSpaamROS:
-    """ROS node to detect pedestrian using DROW3 or DR-SPAAM."""
+class DrSpaamROS(Node):
+    """ROS2 node to detect pedestrian using DROW3 or DR-SPAAM."""
 
     def __init__(self):
+        super().__init__("dr_spaam_ros")
+
         self._read_params()
         self._detector = Detector(
             self.weight_file,
@@ -27,37 +30,81 @@ class DrSpaamROS:
         """
         @brief      Reads parameters from ROS server.
         """
-        self.weight_file = rospy.get_param("~weight_file")
-        self.conf_thresh = rospy.get_param("~conf_thresh")
-        self.stride = rospy.get_param("~stride")
-        self.detector_model = rospy.get_param("~detector_model")
-        self.panoramic_scan = rospy.get_param("~panoramic_scan")
+        self.declare_parameter("weight_file")
+        self.declare_parameter("conf_thresh", 0.5)
+        self.declare_parameter("stride", 1)
+        self.declare_parameter("detector_model", "dr_spaam")
+        self.declare_parameter("panoramic_scan", False)
+
+        # publisher/subscriber parameters
+        self.declare_parameter("subscriber.scan.topic", "/scan")
+        self.declare_parameter("subscriber.scan.queue_size", 10)
+
+        self.declare_parameter("publisher.detections.topic", "/detections")
+        self.declare_parameter("publisher.detections.queue_size", 10)
+        self.declare_parameter("publisher.detections.latch", False)
+
+        self.declare_parameter("publisher.rviz.topic", "/rviz")
+        self.declare_parameter("publisher.rviz.queue_size", 1)
+        self.declare_parameter("publisher.rviz.latch", False)
+
+        # read them back
+        self.weight_file = self.get_parameter("weight_file").value
+        self.conf_thresh = self.get_parameter("conf_thresh").value
+        self.stride = self.get_parameter("stride").value
+        self.detector_model = self.get_parameter("detector_model").value
+        self.panoramic_scan = self.get_parameter("panoramic_scan").value
 
     def _init(self):
         """
         @brief      Initialize ROS connection.
         """
-        # Publisher
-        topic, queue_size, latch = read_publisher_param("detections")
-        self._dets_pub = rospy.Publisher(
-            topic, PoseArray, queue_size=queue_size, latch=latch
-        )
+        # Publishers with QoS handling
+        det_topic = self.get_parameter("publisher.detections.topic").value
+        det_qsize = self.get_parameter("publisher.detections.queue_size").value
+        det_latch = self.get_parameter("publisher.detections.latch").value
 
-        topic, queue_size, latch = read_publisher_param("rviz")
-        self._rviz_pub = rospy.Publisher(
-            topic, Marker, queue_size=queue_size, latch=latch
+        rviz_topic = self.get_parameter("publisher.rviz.topic").value
+        rviz_qsize = self.get_parameter("publisher.rviz.queue_size").value
+        rviz_latch = self.get_parameter("publisher.rviz.latch").value
+
+        qos_profile_det = QoSProfile(
+            depth=det_qsize,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=(
+                QoSDurabilityPolicy.TRANSIENT_LOCAL
+                if det_latch
+                else QoSDurabilityPolicy.VOLATILE
+            ),
         )
+        self._dets_pub = self.create_publisher(PoseArray, det_topic, qos_profile_det)
+
+        qos_profile_rviz = QoSProfile(
+            depth=rviz_qsize,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=(
+                QoSDurabilityPolicy.TRANSIENT_LOCAL
+                if rviz_latch
+                else QoSDurabilityPolicy.VOLATILE
+            ),
+        )
+        self._rviz_pub = self.create_publisher(Marker, rviz_topic, qos_profile_rviz)
 
         # Subscriber
-        topic, queue_size = read_subscriber_param("scan")
-        self._scan_sub = rospy.Subscriber(
-            topic, LaserScan, self._scan_callback, queue_size=queue_size
+        scan_topic = self.get_parameter("subscriber.scan.topic").value
+        scan_qsize = self.get_parameter("subscriber.scan.queue_size").value
+
+        qos_profile_sub = QoSProfile(
+            depth=scan_qsize, reliability=QoSReliabilityPolicy.RELIABLE
+        )
+        self._scan_sub = self.create_subscription(
+            LaserScan, scan_topic, self._scan_callback, qos_profile_sub
         )
 
     def _scan_callback(self, msg):
         if (
-            self._dets_pub.get_num_connections() == 0
-            and self._rviz_pub.get_num_connections() == 0
+            self._dets_pub.get_subscription_count() == 0
+            and self._rviz_pub.get_subscription_count() == 0
         ):
             return
 
@@ -150,22 +197,3 @@ def detections_to_pose_array(dets_xy, dets_cls):
         pose_array.poses.append(p)
 
     return pose_array
-
-
-def read_subscriber_param(name):
-    """
-    @brief      Convenience function to read subscriber parameter.
-    """
-    topic = rospy.get_param("~subscriber/" + name + "/topic")
-    queue_size = rospy.get_param("~subscriber/" + name + "/queue_size")
-    return topic, queue_size
-
-
-def read_publisher_param(name):
-    """
-    @brief      Convenience function to read publisher parameter.
-    """
-    topic = rospy.get_param("~publisher/" + name + "/topic")
-    queue_size = rospy.get_param("~publisher/" + name + "/queue_size")
-    latch = rospy.get_param("~publisher/" + name + "/latch")
-    return topic, queue_size, latch
