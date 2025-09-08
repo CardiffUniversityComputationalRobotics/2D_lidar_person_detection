@@ -197,3 +197,20 @@ def detections_to_pose_array(dets_xy, dets_cls):
         pose_array.poses.append(p)
 
     return pose_array
+
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    dr_spaam_node = DrSpaamROS()
+
+    try:
+        rclpy.spin(dr_spaam_node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        rclpy.try_shutdown()
+
+
+if __name__ == "__main__":
+    main()
