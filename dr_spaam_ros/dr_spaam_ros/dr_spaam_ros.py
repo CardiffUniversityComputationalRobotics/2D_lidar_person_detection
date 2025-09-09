@@ -4,8 +4,10 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
 
 from sensor_msgs.msg import LaserScan
-from geometry_msgs.msg import Point, Pose, PoseArray
+from pedsim_msgs.msg import AgentState, AgentStates
+from geometry_msgs.msg import Point, Pose, PoseArray, TransformStamped
 from visualization_msgs.msg import Marker
+from tf2_ros import TransformBroadcaster
 
 from dr_spaam.detector import Detector
 
@@ -90,6 +92,10 @@ class DrSpaamROS(Node):
         )
         self._rviz_pub = self.create_publisher(Marker, rviz_topic, qos_profile_rviz)
 
+        self.social_agents_pub = self.create_publisher(
+            AgentStates, "/pedsim_simulator/simulated_agents", 10
+        )
+
         # Subscriber
         scan_topic = self.get_parameter("subscriber.scan.topic").value
         scan_qsize = self.get_parameter("subscriber.scan.queue_size").value
@@ -101,7 +107,10 @@ class DrSpaamROS(Node):
             LaserScan, scan_topic, self._scan_callback, qos_profile_sub
         )
 
-    def _scan_callback(self, msg):
+        # Initialize the transform broadcaster
+        self.tf_broadcaster = TransformBroadcaster(self)
+
+    def _scan_callback(self, msg: LaserScan):
         if (
             self._dets_pub.get_subscription_count() == 0
             and self._rviz_pub.get_subscription_count() == 0
@@ -132,6 +141,42 @@ class DrSpaamROS(Node):
         dets_msg = detections_to_pose_array(dets_xy, dets_cls)
         dets_msg.header = msg.header
         self._dets_pub.publish(dets_msg)
+
+        # social agents pub and tfs
+        _id = 1
+
+        social_agents = AgentStates()
+        social_agents = msg.header
+
+        agent_states = []
+
+        for pose in dets_msg.poses:
+            social_agent = AgentState()
+            social_agent.header = msg.header
+            social_agent.id = _id
+            social_agent.pose = pose
+            agent_states.append(social_agent)
+
+            _id = _id + 1
+
+            agent_tf = TransformStamped()
+            agent_tf.header.stamp = msg.header.stamp
+            agent_tf.header.frame_id = "map"
+            agent_tf.child_frame_id = "agent_" + str(_id)
+
+            agent_tf.transform.translation.x = social_agent.pose.position.x
+            agent_tf.transform.translation.y = social_agent.pose.position.y
+
+            agent_tf.transform.rotation.x = social_agent.pose.orientation.x
+            agent_tf.transform.rotation.y = social_agent.pose.orientation.y
+            agent_tf.transform.rotation.z = social_agent.pose.orientation.z
+            agent_tf.transform.rotation.w = social_agent.pose.orientation.w
+
+            self.social_agents_pub.publish(agent_tf)
+
+        social_agents.agent_states = agent_states
+
+        self.social_agents_pub.publish(social_agents)
 
         rviz_msg = detections_to_rviz_marker(dets_xy, dets_cls)
         rviz_msg.header = msg.header
