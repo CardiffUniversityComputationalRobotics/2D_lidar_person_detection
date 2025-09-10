@@ -7,8 +7,8 @@ from sensor_msgs.msg import LaserScan
 from pedsim_msgs.msg import AgentState, AgentStates
 from geometry_msgs.msg import Point, Pose, PoseArray, TransformStamped
 from visualization_msgs.msg import Marker
-from tf2_ros import TransformBroadcaster
-
+from tf2_ros import TransformBroadcaster, TransformListener
+from tf2_ros.buffer import Buffer
 from dr_spaam.detector import Detector
 
 
@@ -110,6 +110,9 @@ class DrSpaamROS(Node):
         # Initialize the transform broadcaster
         self.tf_broadcaster = TransformBroadcaster(self)
 
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
     def _scan_callback(self, msg: LaserScan):
         if (
             self._dets_pub.get_subscription_count() == 0
@@ -137,9 +140,15 @@ class DrSpaamROS(Node):
         dets_xy = dets_xy[conf_mask]
         dets_cls = dets_cls[conf_mask]
 
+        # getting laser transform
+
+        laser_map_tf = self.tf_buffer.lookup_transform(
+            "laser", "map", rclpy.time.Time()
+        )
+
         # convert to ros msg and publish
-        dets_msg = detections_to_pose_array(dets_xy, dets_cls)
-        dets_msg.header = msg.header
+        dets_msg = detections_to_pose_array(dets_xy, dets_cls, laser_map_tf)
+        dets_msg.header = "map"
         self._dets_pub.publish(dets_msg)
 
         # social agents pub and tfs
@@ -230,14 +239,15 @@ def detections_to_rviz_marker(dets_xy, dets_cls):
     return msg
 
 
-def detections_to_pose_array(dets_xy, dets_cls):
+def detections_to_pose_array(dets_xy, dets_cls, laser_tf):
+
     pose_array = PoseArray()
     for d_xy, d_cls in zip(dets_xy, dets_cls):
         # Detector uses following frame convention:
         # x forward, y rightward, z downward, phi is angle w.r.t. x-axis
         p = Pose()
-        p.position.x = d_xy[0]
-        p.position.y = d_xy[1]
+        p.position.x = d_xy[0] + laser_tf.transform.translation.x
+        p.position.y = d_xy[1] + laser_tf.transform.translation.y
         p.position.z = 0.0
         pose_array.poses.append(p)
 
