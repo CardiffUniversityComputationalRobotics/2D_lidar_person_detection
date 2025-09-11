@@ -38,6 +38,8 @@ class DrSpaamROS(Node):
         self.declare_parameter("detector_model", "dr_spaam")
         self.declare_parameter("panoramic_scan", False)
 
+        self.declare_parameter("world_frame", "map")
+
         # publisher/subscriber parameters
         self.declare_parameter("subscriber.scan.topic", "/scan")
         self.declare_parameter("subscriber.scan.queue_size", 10)
@@ -56,6 +58,8 @@ class DrSpaamROS(Node):
         self.stride = self.get_parameter("stride").value
         self.detector_model = self.get_parameter("detector_model").value
         self.panoramic_scan = self.get_parameter("panoramic_scan").value
+
+        self.world_frame = self.get_parameter("world_frame").value
 
     def _init(self):
         """
@@ -113,7 +117,7 @@ class DrSpaamROS(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-    def _scan_callback(self, msg: LaserScan):
+    def _scan_callback(self, laser_msg: LaserScan):
         if (
             self._dets_pub.get_subscription_count() == 0
             and self._rviz_pub.get_subscription_count() == 0
@@ -123,10 +127,10 @@ class DrSpaamROS(Node):
         # TODO check the computation here
         if not self._detector.is_ready():
             self._detector.set_laser_fov(
-                np.rad2deg(msg.angle_increment * len(msg.ranges))
+                np.rad2deg(laser_msg.angle_increment * len(laser_msg.ranges))
             )
 
-        scan = np.array(msg.ranges)
+        scan = np.array(laser_msg.ranges)
         scan[scan == 0.0] = 29.99
         scan[np.isinf(scan)] = 29.99
         scan[np.isnan(scan)] = 29.99
@@ -143,25 +147,27 @@ class DrSpaamROS(Node):
         # getting laser transform
 
         laser_map_tf = self.tf_buffer.lookup_transform(
-            "laser", "map", rclpy.time.Time()
+            laser_msg.header.frame_id, self.world_frame, rclpy.time.Time()
         )
 
         # convert to ros msg and publish
         dets_msg = detections_to_pose_array(dets_xy, dets_cls, laser_map_tf)
-        dets_msg.header = "map"
+        dets_msg.header = self.world_frame
         self._dets_pub.publish(dets_msg)
 
         # social agents pub and tfs
         _id = 1
 
         social_agents = AgentStates()
-        social_agents = msg.header
+        social_agents.header = laser_msg.header
+
+        social_agents.frame_id = 
 
         agent_states = []
 
         for pose in dets_msg.poses:
             social_agent = AgentState()
-            social_agent.header = msg.header
+            social_agent.header = laser_msg.header
             social_agent.id = _id
             social_agent.pose = pose
             agent_states.append(social_agent)
@@ -169,8 +175,8 @@ class DrSpaamROS(Node):
             _id = _id + 1
 
             agent_tf = TransformStamped()
-            agent_tf.header.stamp = msg.header.stamp
-            agent_tf.header.frame_id = "map"
+            agent_tf.header.stamp = laser_msg.header.stamp
+            agent_tf.header.frame_id = self.world_frame
             agent_tf.child_frame_id = "agent_" + str(_id)
 
             agent_tf.transform.translation.x = social_agent.pose.position.x
@@ -188,7 +194,7 @@ class DrSpaamROS(Node):
         self.social_agents_pub.publish(social_agents)
 
         rviz_msg = detections_to_rviz_marker(dets_xy, dets_cls)
-        rviz_msg.header = msg.header
+        rviz_msg.header = laser_msg.header
         self._rviz_pub.publish(rviz_msg)
 
 
