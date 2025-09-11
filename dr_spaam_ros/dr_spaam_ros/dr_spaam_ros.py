@@ -161,7 +161,7 @@ class DrSpaamROS(Node):
         social_agents = AgentStates()
         social_agents.header = laser_msg.header
 
-        social_agents.frame_id = 
+        social_agents.header.frame_id = self.world_frame
 
         agent_states = []
 
