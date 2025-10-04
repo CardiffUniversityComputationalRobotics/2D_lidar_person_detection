@@ -1,3 +1,4 @@
+import time
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -5,20 +6,23 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
 
 from sensor_msgs.msg import LaserScan
 from pedsim_msgs.msg import AgentState, AgentStates
-from geometry_msgs.msg import Point, Pose, PoseArray, TransformStamped
+from geometry_msgs.msg import Point, Pose, PoseArray, TransformStamped, PointStamped
 from visualization_msgs.msg import Marker
 from tf2_ros import TransformBroadcaster, TransformListener
 from tf2_ros.buffer import Buffer
 from dr_spaam.detector import Detector
+from tf_transformations import euler_from_quaternion
+import tf2_geometry_msgs
 
 
 class DrSpaamROS(Node):
     """ROS2 node to detect pedestrian using DROW3 or DR-SPAAM."""
 
     def __init__(self):
-        super().__init__("dr_spaam_ros")
+        super().__init__("dr_spaam_ros_node")
 
         self._read_params()
+
         self._detector = Detector(
             self.weight_file,
             model=self.detector_model,
@@ -105,7 +109,7 @@ class DrSpaamROS(Node):
         scan_qsize = self.get_parameter("subscriber.scan.queue_size").value
 
         qos_profile_sub = QoSProfile(
-            depth=scan_qsize, reliability=QoSReliabilityPolicy.RELIABLE
+            depth=scan_qsize, reliability=QoSReliabilityPolicy.BEST_EFFORT
         )
         self._scan_sub = self.create_subscription(
             LaserScan, scan_topic, self._scan_callback, qos_profile_sub
@@ -146,56 +150,71 @@ class DrSpaamROS(Node):
 
         # getting laser transform
 
-        laser_map_tf = self.tf_buffer.lookup_transform(
-            laser_msg.header.frame_id, self.world_frame, rclpy.time.Time()
-        )
+        try:
 
-        # convert to ros msg and publish
-        dets_msg = detections_to_pose_array(dets_xy, dets_cls, laser_map_tf)
-        dets_msg.header = self.world_frame
-        self._dets_pub.publish(dets_msg)
+            laser_map_tf = self.tf_buffer.lookup_transform(
+                self.world_frame, laser_msg.header.frame_id, rclpy.time.Time()
+            )
 
-        # social agents pub and tfs
-        _id = 1
+            # convert to ros msg and publish
+            dets_msg = detections_to_pose_array(dets_xy, dets_cls)
+            dets_msg.header.frame_id = laser_msg.header.frame_id
+            self._dets_pub.publish(dets_msg)
 
-        social_agents = AgentStates()
-        social_agents.header = laser_msg.header
+            # social agents pub and tfs
+            _id = 0
 
-        social_agents.header.frame_id = self.world_frame
+            social_agents = AgentStates()
+            social_agents.header = laser_msg.header
 
-        agent_states = []
+            social_agents.header.frame_id = self.world_frame
 
-        for pose in dets_msg.poses:
-            social_agent = AgentState()
-            social_agent.header = laser_msg.header
-            social_agent.id = _id
-            social_agent.pose = pose
-            agent_states.append(social_agent)
+            agent_states = []
 
-            _id = _id + 1
+            for pose in dets_msg.poses:
 
-            agent_tf = TransformStamped()
-            agent_tf.header.stamp = laser_msg.header.stamp
-            agent_tf.header.frame_id = self.world_frame
-            agent_tf.child_frame_id = "agent_" + str(_id)
+                agent_tf = TransformStamped()
+                agent_tf.header.stamp = laser_msg.header.stamp
+                agent_tf.header.frame_id = self.world_frame
+                agent_tf.child_frame_id = "agent_" + str(_id)
 
-            agent_tf.transform.translation.x = social_agent.pose.position.x
-            agent_tf.transform.translation.y = social_agent.pose.position.y
+                social_agent_pose = PointStamped()
+                social_agent_pose.point.x = pose.position.x
+                social_agent_pose.point.y = pose.position.y
 
-            agent_tf.transform.rotation.x = social_agent.pose.orientation.x
-            agent_tf.transform.rotation.y = social_agent.pose.orientation.y
-            agent_tf.transform.rotation.z = social_agent.pose.orientation.z
-            agent_tf.transform.rotation.w = social_agent.pose.orientation.w
+                agent_tf_global = tf2_geometry_msgs.do_transform_point(
+                    social_agent_pose, laser_map_tf
+                )
 
-            self.social_agents_pub.publish(agent_tf)
+                agent_tf.transform.translation.x = agent_tf_global.point.x
+                agent_tf.transform.translation.y = agent_tf_global.point.y
 
-        social_agents.agent_states = agent_states
+                agent_tf.transform.rotation.x = pose.orientation.x
+                agent_tf.transform.rotation.y = pose.orientation.y
+                agent_tf.transform.rotation.z = pose.orientation.z
+                agent_tf.transform.rotation.w = pose.orientation.w
 
-        self.social_agents_pub.publish(social_agents)
+                self.tf_broadcaster.sendTransform(agent_tf)
 
-        rviz_msg = detections_to_rviz_marker(dets_xy, dets_cls)
-        rviz_msg.header = laser_msg.header
-        self._rviz_pub.publish(rviz_msg)
+                social_agent = AgentState()
+                social_agent.header = laser_msg.header
+                social_agent.header.frame_id = self.world_frame
+                social_agent.id = _id
+                social_agent.pose.position.x = agent_tf.transform.translation.x
+                social_agent.pose.position.y = agent_tf.transform.translation.y
+                agent_states.append(social_agent)
+
+                _id = _id + 1
+
+            social_agents.agent_states = agent_states
+
+            self.social_agents_pub.publish(social_agents)
+
+            rviz_msg = detections_to_rviz_marker(dets_xy, dets_cls)
+            rviz_msg.header = laser_msg.header
+            self._rviz_pub.publish(rviz_msg)
+        except Exception as e:
+            print(e)
 
 
 def detections_to_rviz_marker(dets_xy, dets_cls):
@@ -245,15 +264,15 @@ def detections_to_rviz_marker(dets_xy, dets_cls):
     return msg
 
 
-def detections_to_pose_array(dets_xy, dets_cls, laser_tf):
+def detections_to_pose_array(dets_xy, dets_cls):
 
     pose_array = PoseArray()
     for d_xy, d_cls in zip(dets_xy, dets_cls):
         # Detector uses following frame convention:
         # x forward, y rightward, z downward, phi is angle w.r.t. x-axis
         p = Pose()
-        p.position.x = d_xy[0] + laser_tf.transform.translation.x
-        p.position.y = d_xy[1] + laser_tf.transform.translation.y
+        p.position.x = float(d_xy[0])
+        p.position.y = float(d_xy[1])
         p.position.z = 0.0
         pose_array.poses.append(p)
 
