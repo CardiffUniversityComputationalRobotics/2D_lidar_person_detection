@@ -1,16 +1,17 @@
 dr_spaam_ros_node:
-  publisher:
-    detections:
-      topic: /dr_spaam_detections
-      queue_size: 1
-      latch: false
+  ros__parameters:
+    publisher:
+      detections:
+        topic: /dr_spaam_detections
+        queue_size: 1
+        latch: false
 
-    rviz:
-      topic: /dr_spaam_rviz
-      queue_size: 1
-      latch: false
+      rviz:
+        topic: /dr_spaam_rviz
+        queue_size: 1
+        latch: false
 
-  subscriber:
-    scan:
-      topic: /segway/scan_multi
-      queue_size: 1
+    subscriber:
+      scan:
+        topic: /scan
+        queue_size: 1
