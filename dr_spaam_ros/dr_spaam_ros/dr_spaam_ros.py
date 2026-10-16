@@ -1,17 +1,31 @@
+import math
 import time
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
+from scipy.optimize import linear_sum_assignment
 
 from sensor_msgs.msg import LaserScan
 from pedsim_msgs.msg import AgentState, AgentStates
-from geometry_msgs.msg import Point, Pose, PoseArray, TransformStamped, PointStamped
+from geometry_msgs.msg import (
+    Point,
+    Pose,
+    PoseArray,
+    Quaternion,
+    TransformStamped,
+    PointStamped,
+)
 from visualization_msgs.msg import Marker
-from tf2_ros import TransformBroadcaster, TransformListener
+from tf2_ros import TransformBroadcaster, TransformException, TransformListener
 from tf2_ros.buffer import Buffer
 from dr_spaam.detector import Detector
-from tf_transformations import euler_from_quaternion
+from tf_transformations import (
+    euler_from_quaternion,
+    quaternion_from_euler,
+    quaternion_inverse,
+    quaternion_multiply,
+)
 import tf2_geometry_msgs
 
 
@@ -30,6 +44,13 @@ class DrSpaamROS(Node):
             stride=self.stride,
             panoramic_scan=self.panoramic_scan,
         )
+        self._tracker = PersonTracker(
+            self.tracking_max_association_dist,
+            self.tracking_timeout,
+            self.tracking_velocity_smoothing_time,
+            self.tracking_min_speed,
+            self.tracking_min_hits,
+        )
         self._init()
 
     def _read_params(self):
@@ -38,11 +59,19 @@ class DrSpaamROS(Node):
         """
         self.declare_parameter("weight_file")
         self.declare_parameter("conf_thresh", 0.5)
+        self.declare_parameter("max_range", 0.0)  # [m] from the laser, 0 = no limit
         self.declare_parameter("stride", 1)
         self.declare_parameter("detector_model", "dr_spaam")
         self.declare_parameter("panoramic_scan", False)
 
         self.declare_parameter("world_frame", "map")
+
+        # tracking of detections between scans, used to estimate the heading
+        self.declare_parameter("tracking.max_association_dist", 0.8)
+        self.declare_parameter("tracking.timeout", 1.0)
+        self.declare_parameter("tracking.velocity_smoothing_time", 0.5)
+        self.declare_parameter("tracking.min_speed", 0.3)
+        self.declare_parameter("tracking.min_hits", 3)
 
         # publisher/subscriber parameters
         self.declare_parameter("subscriber.scan.topic", "/scan")
@@ -59,11 +88,22 @@ class DrSpaamROS(Node):
         # read them back
         self.weight_file = self.get_parameter("weight_file").value
         self.conf_thresh = self.get_parameter("conf_thresh").value
+        self.max_range = self.get_parameter("max_range").value
         self.stride = self.get_parameter("stride").value
         self.detector_model = self.get_parameter("detector_model").value
         self.panoramic_scan = self.get_parameter("panoramic_scan").value
 
         self.world_frame = self.get_parameter("world_frame").value
+
+        self.tracking_max_association_dist = self.get_parameter(
+            "tracking.max_association_dist"
+        ).value
+        self.tracking_timeout = self.get_parameter("tracking.timeout").value
+        self.tracking_velocity_smoothing_time = self.get_parameter(
+            "tracking.velocity_smoothing_time"
+        ).value
+        self.tracking_min_speed = self.get_parameter("tracking.min_speed").value
+        self.tracking_min_hits = self.get_parameter("tracking.min_hits").value
 
     def _init(self):
         """
@@ -121,10 +161,31 @@ class DrSpaamROS(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
+    def _laser_transform(self, header):
+        """
+        @brief      Transform from the laser to the world frame when the scan was taken,
+                    the robot may have moved since (the scan is ~0.15 s old here)
+        """
+        try:
+            return self.tf_buffer.lookup_transform(
+                self.world_frame, header.frame_id, rclpy.time.Time.from_msg(header.stamp)
+            )
+        except TransformException as e:
+            self.get_logger().warn(
+                "No transform at the scan time, using the latest one: %s" % e,
+                throttle_duration_sec=5.0,
+            )
+            return self.tf_buffer.lookup_transform(
+                self.world_frame, header.frame_id, rclpy.time.Time()
+            )
+
     def _scan_callback(self, laser_msg: LaserScan):
+        # skip the inference when nobody uses any output (the agents feed the planner
+        # and the predictor even without rviz)
         if (
             self._dets_pub.get_subscription_count() == 0
             and self._rviz_pub.get_subscription_count() == 0
+            and self.social_agents_pub.get_subscription_count() == 0
         ):
             return
 
@@ -148,63 +209,89 @@ class DrSpaamROS(Node):
         dets_xy = dets_xy[conf_mask]
         dets_cls = dets_cls[conf_mask]
 
+        # ignore detections farther than the laser can resolve people
+        if self.max_range > 0.0:
+            in_range = np.hypot(dets_xy[:, 0], dets_xy[:, 1]) <= self.max_range
+            dets_xy = dets_xy[in_range]
+            dets_cls = dets_cls[in_range]
+
         # getting laser transform
 
         try:
 
-            laser_map_tf = self.tf_buffer.lookup_transform(
-                self.world_frame, laser_msg.header.frame_id, rclpy.time.Time()
-            )
+            laser_map_tf = self._laser_transform(laser_msg.header)
+
+            # track the detections in the world frame, so the robot motion does
+            # not look like people moving, to get their ids and headings
+            dets_xy_world = []
+            for d_xy in dets_xy:
+                det_point = PointStamped()
+                det_point.point.x = float(d_xy[0])
+                det_point.point.y = float(d_xy[1])
+                det_point = tf2_geometry_msgs.do_transform_point(
+                    det_point, laser_map_tf
+                )
+                dets_xy_world.append((det_point.point.x, det_point.point.y))
+
+            stamp = laser_msg.header.stamp.sec + laser_msg.header.stamp.nanosec * 1e-9
+            tracks = self._tracker.update(dets_xy_world, stamp)
+
+            # only publish people confirmed by the tracker
+            confirmed = np.array([t.id is not None for t in tracks], dtype=bool)
+            dets_xy = dets_xy[confirmed]
+            dets_cls = dets_cls[confirmed]
+            tracks = [t for t in tracks if t.id is not None]
 
             # convert to ros msg and publish
             dets_msg = detections_to_pose_array(dets_xy, dets_cls)
-            dets_msg.header.frame_id = laser_msg.header.frame_id
+            dets_msg.header = laser_msg.header
+
+            # headings are in the world frame, the detections in the laser frame
+            q = laser_map_tf.transform.rotation
+            q_laser_world = quaternion_inverse([q.x, q.y, q.z, q.w])
+            for pose, track in zip(dets_msg.poses, tracks):
+                pose.orientation = to_quaternion_msg(
+                    quaternion_multiply(
+                        q_laser_world, quaternion_from_euler(0.0, 0.0, track.heading)
+                    )
+                )
             self._dets_pub.publish(dets_msg)
 
-            # social agents pub and tfs
-            _id = 0
-
+            # social agents pub and tfs (copy only the stamp: assigning the scan
+            # header would also change the frame of the rviz marker below)
             social_agents = AgentStates()
-            social_agents.header = laser_msg.header
-
+            social_agents.header.stamp = laser_msg.header.stamp
             social_agents.header.frame_id = self.world_frame
 
             agent_states = []
 
-            for pose in dets_msg.poses:
+            for track in tracks:
+                q_heading = quaternion_from_euler(0.0, 0.0, track.heading)
 
                 agent_tf = TransformStamped()
                 agent_tf.header.stamp = laser_msg.header.stamp
                 agent_tf.header.frame_id = self.world_frame
-                agent_tf.child_frame_id = "agent_" + str(_id)
+                agent_tf.child_frame_id = "agent_" + str(track.id)
 
-                social_agent_pose = PointStamped()
-                social_agent_pose.point.x = pose.position.x
-                social_agent_pose.point.y = pose.position.y
-
-                agent_tf_global = tf2_geometry_msgs.do_transform_point(
-                    social_agent_pose, laser_map_tf
-                )
-
-                agent_tf.transform.translation.x = agent_tf_global.point.x
-                agent_tf.transform.translation.y = agent_tf_global.point.y
-
-                agent_tf.transform.rotation.x = pose.orientation.x
-                agent_tf.transform.rotation.y = pose.orientation.y
-                agent_tf.transform.rotation.z = pose.orientation.z
-                agent_tf.transform.rotation.w = pose.orientation.w
+                agent_tf.transform.translation.x = float(track.xy[0])
+                agent_tf.transform.translation.y = float(track.xy[1])
+                agent_tf.transform.rotation = to_quaternion_msg(q_heading)
 
                 self.tf_broadcaster.sendTransform(agent_tf)
 
+                # standing people are reported with zero velocity
+                vel = track.vel if track.moving else (0.0, 0.0)
+
                 social_agent = AgentState()
-                social_agent.header = laser_msg.header
+                social_agent.header.stamp = laser_msg.header.stamp
                 social_agent.header.frame_id = self.world_frame
-                social_agent.id = _id
+                social_agent.id = track.id
                 social_agent.pose.position.x = agent_tf.transform.translation.x
                 social_agent.pose.position.y = agent_tf.transform.translation.y
+                social_agent.pose.orientation = to_quaternion_msg(q_heading)
+                social_agent.twist.linear.x = float(vel[0])
+                social_agent.twist.linear.y = float(vel[1])
                 agent_states.append(social_agent)
-
-                _id = _id + 1
 
             social_agents.agent_states = agent_states
 
@@ -277,6 +364,118 @@ def detections_to_pose_array(dets_xy, dets_cls):
         pose_array.poses.append(p)
 
     return pose_array
+
+
+def to_quaternion_msg(q):
+    return Quaternion(x=float(q[0]), y=float(q[1]), z=float(q[2]), w=float(q[3]))
+
+
+class Track(object):
+    """A detected person followed over consecutive scans, in the world frame."""
+
+    def __init__(self, xy, stamp):
+        self.id = None  # given once the person is confirmed
+        self.hits = 1  # number of scans the person was detected in
+        self.xy = np.array(xy, dtype=np.float64)
+        self.vel = np.zeros(2)
+        self.heading = 0.0  # unknown until the person moves
+        self.moving = False
+        self.stamp = stamp  # time of the last detection
+
+
+class PersonTracker(object):
+    """
+    @brief      Associates detections between scans, so each person keeps its id,
+                and estimates their velocity and heading from their previous and
+                current positions. A person is confirmed (gets an id) only after
+                being detected in min_hits consecutive scans, which filters out
+                short-lived false positives.
+    """
+
+    def __init__(
+        self,
+        max_association_dist,
+        timeout,
+        velocity_smoothing_time,
+        min_speed,
+        min_hits,
+    ):
+        self.max_association_dist = max_association_dist
+        self.timeout = timeout
+        self.velocity_smoothing_time = velocity_smoothing_time
+        self.min_speed = min_speed
+        self.min_hits = min_hits
+        self._tracks = []
+
+    def update(self, dets_xy, stamp):
+        """
+        @brief      Matches the detections to the tracked people and updates them.
+        @param      dets_xy  Detection positions in the world frame, (N, 2)
+        @param      stamp    Scan time in seconds
+        @return     The track of each detection, in the same order, only the
+                    confirmed ones (with an id) should be published
+        """
+        # forget people not seen for a while (or everyone if time jumped back)
+        self._tracks = [
+            t for t in self._tracks if 0.0 <= stamp - t.stamp <= self.timeout
+        ]
+
+        dets_xy = np.asarray(dets_xy, dtype=np.float64).reshape(-1, 2)
+        dets_track = [None] * len(dets_xy)
+
+        if self._tracks and len(dets_xy) > 0:
+            # compare with where each person would be now if they kept walking
+            pred_xy = np.array([t.xy + t.vel * (stamp - t.stamp) for t in self._tracks])
+            dist = np.linalg.norm(pred_xy[:, None] - dets_xy[None, :], axis=2)
+            gated_dist = np.where(dist <= self.max_association_dist, dist, 1e6)
+            for i, j in zip(*linear_sum_assignment(gated_dist)):
+                if dist[i, j] <= self.max_association_dist:
+                    self._update_track(self._tracks[i], dets_xy[j], stamp)
+                    dets_track[j] = self._tracks[i]
+
+        # people not confirmed yet must be detected in consecutive scans
+        self._tracks = [
+            t for t in self._tracks if t.id is not None or t.stamp == stamp
+        ]
+
+        for j in range(len(dets_xy)):
+            if dets_track[j] is None:
+                dets_track[j] = Track(dets_xy[j], stamp)
+                self._tracks.append(dets_track[j])
+
+        for track in dets_track:
+            if track.id is None and track.hits >= self.min_hits:
+                track.id = self._free_id()
+
+        return dets_track
+
+    def _update_track(self, track, xy, stamp):
+        dt = stamp - track.stamp
+        if dt > 0.0:
+            # velocity from the previous and current position, low-pass filtered
+            # since the detected positions jitter a few cm between scans
+            alpha = 1.0
+            if self.velocity_smoothing_time > 0.0:
+                alpha = 1.0 - math.exp(-dt / self.velocity_smoothing_time)
+            track.vel += alpha * ((xy - track.xy) / dt - track.vel)
+
+            # the heading follows the walking direction, standing people keep it
+            track.moving = math.hypot(track.vel[0], track.vel[1]) >= self.min_speed
+            if track.moving:
+                track.heading = math.atan2(track.vel[1], track.vel[0])
+
+        track.xy = np.array(xy, dtype=np.float64)
+        track.stamp = stamp
+        track.hits += 1
+
+    def _free_id(self):
+        # ids of people lost for longer than the timeout are reused, so the ids
+        # (and agent_<id> frames) stay as few as the people seen at once
+        used_ids = {t.id for t in self._tracks}
+        track_id = 0
+        while track_id in used_ids:
+            track_id += 1
+        return track_id
 
 
 def main(args=None):
